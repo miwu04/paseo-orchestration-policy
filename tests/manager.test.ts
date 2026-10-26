@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { after, test, type TestContext } from "node:test";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ConfigSchema } from "../shared/contracts.ts";
 import { Manager, type AgentSnapshot, type Task, type Transport } from "../server/manager.ts";
-import { saveJson } from "../server/store.ts";
+import { digest, saveJson } from "../server/store.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../.test-work/manager");
 after(() => rmSync(root, { recursive: true, force: true }));
@@ -206,15 +206,21 @@ test("only the current task owner and attempt can submit an upstream decision re
 
 test("a worker requires a distinct reviewer bound to the current generation before acceptance", async t => {
   const s = setup(t);
+  const publish = (subjectId: string, reviewer: Task, generation: number) => {
+    saveJson(join(s.directory, "state", "reviews", `${subjectId}.json`), { subjectTaskId: subjectId, reviewerTaskId: reviewer.id, reviewerAgentId: reviewer.agentId, subjectGeneration: generation, verdict: "pass", reportPath: reviewer.reportPath, reportDigest: digest(readFileSync(reviewer.reportPath!, "utf8")) });
+  };
   const worker = await s.create(); await s.manager.tick(); await s.complete(worker);
   const reviewer = await s.create({ role: "reviewer", subjectTaskId: worker.id });
   await s.manager.tick(); await s.complete(reviewer);
+  assert.throws(() => s.manager.recordReview(worker.id, reviewer.id, "pass", "Parent verdict only"), /没有留下针对本任务的审查记录/);
+  publish(worker.id, reviewer, worker.generation);
   s.manager.recordReview(worker.id, reviewer.id, "pass", "Read the actual report and accepted it");
   await s.manager.continueTask(worker.id, "Fix a newly identified defect");
   await s.complete(worker);
   assert.throws(() => s.manager.recordReview(worker.id, reviewer.id, "pass", "Old review"), /过期/);
   const fresh = await s.create({ role: "reviewer", subjectTaskId: worker.id });
   await s.manager.tick(); await s.complete(fresh);
+  publish(worker.id, fresh, worker.generation);
   s.manager.recordReview(worker.id, fresh.id, "pass", "Current generation reviewed");
   s.manager.accept(worker.id);
   assert.equal(worker.phase, "accepted");
@@ -235,4 +241,21 @@ test("a second coordinator and invalid persisted state both fail closed", async 
   s.manager.close();
   saveJson(join(s.directory, "state", "orchestration.json"), { schemaVersion: 99 });
   assert.throws(() => new Manager(join(s.directory, "state"), s.manager.config, s.api));
+});
+
+test("sibling tasks can message each other while unrelated or ended tasks cannot", async t => {
+  const s = setup(t);
+  const first = await s.create({ role: "scout" });
+  const second = await s.create({ role: "scout" });
+  const foreign = await s.create({ role: "scout", parentAgentId: "other-parent" });
+  await s.manager.tick();
+  await s.manager.applyAction(first.agentId!, { action: "message", toTaskId: second.id, body: "The interface signature changed; read it before writing." });
+  const peer = Object.values(s.manager.state.messages).find(message => message.recipientId === second.agentId);
+  assert.ok(peer);
+  assert.equal(peer.attemptId, first.attemptId);
+  await assert.rejects(s.manager.applyAction(first.agentId!, { action: "message", toTaskId: foreign.id, body: "hello" }), /同一上游/);
+  await assert.rejects(s.manager.applyAction(first.agentId!, { action: "message", toTaskId: first.id, body: "hello" }), /给自己/);
+  s.manager.state.tasks[second.id].phase = "accepted";
+  await assert.rejects(s.manager.applyAction(first.agentId!, { action: "message", toTaskId: second.id, body: "hello" }), /不接受消息/);
+  await assert.rejects(s.manager.applyAction(null, { action: "message", toTaskId: second.id, body: "hello" }), /受管理的任务 agent/);
 });

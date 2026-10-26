@@ -5,6 +5,7 @@ export const TaskInputSchema = z.object({
   workspaceId: z.string().min(1), parentAgentId: z.string().min(1).optional(),
   title: z.string().min(1).max(200), prompt: z.string().min(1).max(65_536),
   provider: z.string().min(1), role: z.enum(["worker", "reviewer", "scout", "researcher", "oracle", "evidence-auditor"]),
+  paths: z.array(z.string().min(1)).default([]), allowCommit: z.boolean().default(false),
   subjectTaskId: z.string().uuid().optional(), dependsOn: z.array(z.string().uuid()).default([]),
   timeoutMs: z.number().int().positive().max(86_400_000).default(1_800_000),
 }).strict();
@@ -16,6 +17,8 @@ export const ActionSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("continue"), taskId: z.string().uuid(), prompt: z.string().min(1).max(65_536) }),
   z.object({ action: z.literal("review"), taskId: z.string().uuid(), reviewerTaskId: z.string().uuid(), verdict: z.enum(["pass", "block"]), note: z.string().min(1) }),
   z.object({ action: z.literal("accept"), taskId: z.string().uuid() }),
+  z.object({ action: z.literal("message"), toTaskId: z.string().uuid(), body: z.string().min(1).max(16_384) }),
+  z.object({ action: z.literal("approveCommit"), taskId: z.string().uuid(), revision: z.string().min(1), paths: z.array(z.string().min(1)).min(1) }),
   z.object({ action: z.literal("ack"), messageId: z.string().uuid() }),
   z.object({ action: z.literal("reconcile") }),
 ]);

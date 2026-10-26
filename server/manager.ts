@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
-import { TaskInputSchema, type Config } from "../shared/contracts.ts";
+import { TaskInputSchema, ActionSchema, type Config } from "../shared/contracts.ts";
 import { CoordinatorLock, digest, readJson, saveJson } from "./store.ts";
 
 const phases = ["queued", "launching", "running", "waiting_permission", "collecting_report", "awaiting_review", "blocked", "failed", "canceled", "accepted"] as const;
@@ -266,7 +266,7 @@ export class Manager {
   async tick(): Promise<void> {
     if (this.disposed) return;
     if (this.ticking) return this.ticking;
-    this.ticking = (async () => { this.ingestRequests(); await this.reconcile(); await this.launchReady(); await this.drain(); })();
+    this.ticking = (async () => { await this.ingestControl(); this.ingestRequests(); await this.reconcile(); await this.launchReady(); await this.drain(); })();
     try { await this.ticking; } finally { this.ticking = null; }
   }
 
@@ -294,12 +294,27 @@ export class Manager {
     const reviewer = this.task(reviewerId);
     if (task.phase !== "awaiting_review" || reviewer.phase !== "awaiting_review" || !reviewer.reportPath || !existsSync(reviewer.reportPath)) throw new Error("实现或独立审查报告尚未取得");
     if (reviewer.role !== "reviewer" || reviewer.subjectTaskId !== id || reviewer.subjectGeneration !== task.generation || reviewer.agentId === task.agentId) throw new Error("审查者不独立或审查对应的执行阶段已经过期");
+    const evidence = readJson<{ reviewerAgentId: string; subjectGeneration: number | null; verdict: string; reportPath: string; reportDigest: string }>(join(this.root, "reviews", `${id}.json`));
+    if (!evidence) throw new Error("审查者没有留下针对本任务的审查记录；只读父级结论不作证据");
+    if (evidence.reviewerAgentId !== reviewer.agentId || evidence.subjectGeneration !== task.generation) throw new Error("审查记录不属于当前审查者或当前执行阶段");
+    if (evidence.verdict !== verdict) throw new Error("登记结论与审查者留下的记录不一致");
+    if (evidence.reportDigest !== digest(readFileSync(evidence.reportPath, "utf8"))) throw new Error("审查报告与登记时不一致，需要重新审查");
     const freezePath = join(this.root, "freezes", `${digest(task.cwd)}.json`);
     const freeze = readJson<{ taskId: string; reviewerTaskId: string; generation: number }>(freezePath);
     if (freeze?.taskId !== task.id || freeze.reviewerTaskId !== reviewerId || freeze.generation !== task.generation) throw new Error("审查归属与当前目录记录不一致，需要先核对");
     task.review = { reviewerTaskId: reviewerId, generation: task.generation, verdict, note };
     this.save();
     unlinkSync(freezePath);
+  }
+
+  // Approval is bound to one attempt, the exact content revision and the path set the worker may commit.
+  approveCommit(id: string, revision: string, paths: string[]): void {
+    const task = this.task(id);
+    if (task.role !== "worker") throw new Error("只有实现任务存在提交批准");
+    if (!task.allowCommit) throw new Error("任务派出时没有授予提交权限");
+    if (!["running", "awaiting_review"].includes(task.phase)) throw new Error(`当前阶段不能批准提交：${task.phase}`);
+    saveJson(join(this.root, "approvals", `${id}.json`), { attemptId: task.attemptId, revision, paths });
+    this.save();
   }
 
   accept(id: string): void {
@@ -316,6 +331,67 @@ export class Manager {
     message.status = "acknowledged";
     if (message.recipientId) saveJson(join(this.root, "acks", `${id}.json`), { recipientId: message.recipientId, acknowledgedAt: new Date(this.now()).toISOString() });
     this.save();
+  }
+  // Peer messages travel through the same durable queue, so a sibling cannot be woken silently or lose the text.
+  private deliverPeer(sender: Task, recipient: Task, body: string): void {
+    const id = randomUUID();
+    this.state.messages[id] = {
+      id, key: `peer:${sender.id}:${id}`, taskId: sender.id, attemptId: sender.attemptId, recipientId: recipient.agentId,
+      body, attempts: 0, status: "pending", nextAttemptAt: this.now(), deadlineAt: this.now() + this.config.notificationTimeoutMs, error: null,
+    };
+    this.save();
+  }
+  // Only a session that owns no task is a dispatcher; a managed agent may act on tasks it dispatched.
+  private mayManage(task: Task | undefined, actorId: string): boolean {
+    if (this.find(actorId)) return Boolean(task && task.parentAgentId === actorId);
+    return !task || !task.parentAgentId || task.parentAgentId === actorId;
+  }
+  async applyAction(actorId: string | null, action: z.infer<typeof ActionSchema>): Promise<string> {
+    if (action.action === "status") return this.status();
+    if (action.action === "create") {
+      if (actorId && this.find(actorId)) throw new Error("已有任务的 agent 不能再派发新任务");
+      const created = await this.create({ ...action.task, parentAgentId: actorId ?? action.task.parentAgentId });
+      return JSON.stringify(created);
+    }
+    if (action.action === "ack") {
+      if (actorId && this.state.messages[action.messageId]?.recipientId !== actorId) throw new Error("只有消息接收方可以确认回执");
+      this.acknowledge(action.messageId);
+      return this.status();
+    }
+    if (action.action === "reconcile") { await this.reconcile(); return this.status(); }
+    if (action.action === "message") {
+      const sender = actorId ? Object.values(this.state.tasks).find(item => item.agentId === actorId) : undefined;
+      if (!sender) throw new Error("只有受管理的任务 agent 可以向同级发消息");
+      const recipient = this.task(action.toTaskId);
+      if (recipient.id === sender.id) throw new Error("不能给自己发消息");
+      if (!recipient.agentId) throw new Error("目标任务还没有执行者");
+      if (["queued", "accepted", "canceled", "failed"].includes(recipient.phase)) throw new Error(`目标任务当前不接受消息：${recipient.phase}`);
+      if ((recipient.parentAgentId ?? null) !== (sender.parentAgentId ?? null)) throw new Error("只能与同一上游下的同级任务通信");
+      this.deliverPeer(sender, recipient, action.body);
+      return this.status();
+    }
+    const task = this.task(action.taskId);
+    if (actorId && !this.mayManage(task, actorId)) throw new Error("当前会话不能管理该任务");
+    if (action.action === "continue") await this.continueTask(action.taskId, action.prompt);
+    else if (action.action === "review") this.recordReview(action.taskId, action.reviewerTaskId, action.verdict, action.note);
+    else if (action.action === "approveCommit") this.approveCommit(action.taskId, action.revision, action.paths);
+    else if (action.action === "accept") this.accept(action.taskId);
+    return this.status();
+  }
+  // Request files written by Pi sessions: the caller identity comes from the request, and results are recorded once.
+  private async ingestControl(): Promise<void> {
+    const directory = join(this.root, "requests");
+    if (!existsSync(directory)) return;
+    for (const name of readdirSync(directory).filter(name => /^[a-f0-9-]+\.json$/.test(name))) {
+      const request = readJson<{ id?: string; actorId?: string; action?: unknown }>(join(directory, name));
+      if (!request?.action) continue;
+      const resultPath = join(this.root, "results", name);
+      if (existsSync(resultPath)) continue;
+      const parsed = z.object({ id: z.string().uuid(), actorId: z.string().min(1), action: ActionSchema }).safeParse(request);
+      if (!parsed.success) { saveJson(resultPath, { id: request.id ?? name, error: "请求格式无效" }); continue; }
+      try { saveJson(resultPath, { id: parsed.data.id, text: await this.applyAction(parsed.data.actorId, parsed.data.action) }); }
+      catch (error) { saveJson(resultPath, { id: parsed.data.id, error: String(error) }); }
+    }
   }
   status(): string { return JSON.stringify({ collectedAt: new Date(this.now()).toISOString(), ...this.state }, null, 2); }
   close(): void { this.disposed = true; this.lock.release(); }

@@ -10,6 +10,8 @@
       "title": "<任务标题>",
       "provider": "pi/<实际模型>",
       "role": "worker",
+      "paths": ["<可写路径>"],
+      "allowCommit": false,
       "prompt": "<完整任务合同>",
       "dependsOn": [],
       "timeoutMs": 1800000
@@ -30,6 +32,12 @@
   "accept": {
     "action": "accept",
     "taskId": "<任务编号>"
+  },
+  "approveCommit": {
+    "action": "approveCommit",
+    "taskId": "<实现任务编号>",
+    "revision": "<被批准内容的内容版本>",
+    "paths": ["<可提交路径>"]
   },
   "ack": {
     "action": "ack",

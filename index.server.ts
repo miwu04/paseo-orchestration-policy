@@ -58,13 +58,9 @@ export default function contribute(server: PluginServerContext) {
 
   server.handle(control, async (input, { paseo }) => {
     const current = ensure(paseo);
-    if (input.action === "create") await current.create(input.task);
-    else if (input.action === "continue") await current.continueTask(input.taskId, input.prompt);
-    else if (input.action === "review") current.recordReview(input.taskId, input.reviewerTaskId, input.verdict, input.note);
-    else if (input.action === "accept") current.accept(input.taskId);
-    else if (input.action === "ack") current.acknowledge(input.messageId);
+    const text = await current.applyAction(null, input);
     if (input.action !== "status") await current.tick();
-    return { text: current.status() };
+    return { text };
   });
 
   return () => {
