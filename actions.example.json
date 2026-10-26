@@ -1,0 +1,41 @@
+{
+  "status": {
+    "action": "status"
+  },
+  "create": {
+    "action": "create",
+    "task": {
+      "workspaceId": "<工作目录编号>",
+      "parentAgentId": "<上游 agent 编号>",
+      "title": "<任务标题>",
+      "provider": "pi/<实际模型>",
+      "role": "worker",
+      "prompt": "<完整任务合同>",
+      "dependsOn": [],
+      "timeoutMs": 1800000
+    }
+  },
+  "continue": {
+    "action": "continue",
+    "taskId": "<任务编号>",
+    "prompt": "<明确的后续阶段>"
+  },
+  "review": {
+    "action": "review",
+    "taskId": "<实现任务编号>",
+    "reviewerTaskId": "<独立审查任务编号>",
+    "verdict": "pass",
+    "note": "<用户阅读实际报告后的判断>"
+  },
+  "accept": {
+    "action": "accept",
+    "taskId": "<任务编号>"
+  },
+  "ack": {
+    "action": "ack",
+    "messageId": "<消息编号>"
+  },
+  "reconcile": {
+    "action": "reconcile"
+  }
+}

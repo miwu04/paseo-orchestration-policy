@@ -1,0 +1,15 @@
+{
+  "allowedProviders": [
+    "pi"
+  ],
+  "maxActive": 5,
+  "maxNotificationAttempts": 3,
+  "retryDelaysMs": [
+    5000,
+    30000,
+    120000
+  ],
+  "notificationTimeoutMs": 600000,
+  "reconcileIntervalMs": 5000,
+  "enforceWorktreeCreation": false
+}
